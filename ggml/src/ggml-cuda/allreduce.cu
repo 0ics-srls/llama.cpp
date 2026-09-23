@@ -335,6 +335,17 @@ struct ggml_cuda_ar_pipeline {
     // memory; CPU never reads/writes -- only the kernel and cudaMemset.
     // Use ggml_cuda_ar_arrival_ptr() to index.
     ggml_cuda_ar_host_mapping arrival;
+
+    // Statistiche (GGML_CUDA_AR_STATS=N: stampa ogni N chiamate; 0 = spento).
+    // t0 sullo stream di calcolo quando arriva all'AR, t1 quando il risultato e' pronto:
+    // la differenza e' il tempo in cui il motore di calcolo di quella GPU aspetta l'AR.
+    uint64_t    stats_every;
+    uint64_t    stats_n;
+    uint64_t    stats_bytes;
+    double      stats_ms[GGML_CUDA_MAX_DEVICES];
+    cudaEvent_t stats_t0[GGML_CUDA_MAX_DEVICES][4];
+    cudaEvent_t stats_t1[GGML_CUDA_MAX_DEVICES][4];
+    bool        stats_valid[4];
 };
 
 // Base pointer for the (slot, rank) per-block token block.  The kernel adds
@@ -360,6 +371,8 @@ struct ggml_cuda_ar_slot_info {
     int slot;
     int token;
 };
+
+static void ggml_cuda_ar_stats_print(ggml_cuda_ar_pipeline * p, const char * tag);
 
 static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p) {
     const int  slot        = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
@@ -433,6 +446,17 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    p->stats_every      = ggml_cuda_ar_env_u64("GGML_CUDA_AR_STATS", 0);
+    if (p->stats_every > 0) {
+        for (size_t i = 0; i < n_devices; ++i) {
+            ggml_cuda_set_device(devices[i]);
+            for (int r = 0; r < 4; ++r) {
+                CUDA_CHECK(cudaEventCreate(&p->stats_t0[i][r]));
+                CUDA_CHECK(cudaEventCreate(&p->stats_t1[i][r]));
+            }
+        }
+        GGML_LOG_INFO("%s: AR stats enabled, printing every %llu calls\n", __func__, (unsigned long long) p->stats_every);
+    }
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
@@ -542,6 +566,16 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
     if (!p) {
         return;
+    }
+    if (p->stats_every > 0) {
+        ggml_cuda_ar_stats_print(p, "final");
+        for (int i = 0; i < p->n_devices; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            for (int r = 0; r < 4; ++r) {
+                if (p->stats_t0[i][r]) { CUDA_CHECK(cudaEventDestroy(p->stats_t0[i][r])); }
+                if (p->stats_t1[i][r]) { CUDA_CHECK(cudaEventDestroy(p->stats_t1[i][r])); }
+            }
+        }
     }
 
     // Drain all in-flight kernels before tearing down resources.
@@ -745,7 +779,7 @@ static bool ggml_cuda_ar_allreduce_copy_outer(
     return ok;
 }
 
-bool ggml_cuda_ar_allreduce(
+static bool ggml_cuda_ar_allreduce_impl(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
         ggml_tensor           ** tensors) {
@@ -954,6 +988,71 @@ bool ggml_cuda_ar_allreduce(
         }
     }
 
+    return ok;
+}
+
+static void ggml_cuda_ar_stats_flush(ggml_cuda_ar_pipeline * p, int ring) {
+    if (!p->stats_valid[ring]) {
+        return;
+    }
+    for (int i = 0; i < p->n_devices; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaEventSynchronize(p->stats_t1[i][ring]));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, p->stats_t0[i][ring], p->stats_t1[i][ring]));
+        p->stats_ms[i] += ms;
+    }
+    p->stats_valid[ring] = false;
+}
+
+static void ggml_cuda_ar_stats_print(ggml_cuda_ar_pipeline * p, const char * tag) {
+    for (int r = 0; r < 4; ++r) {
+        ggml_cuda_ar_stats_flush(p, r);
+    }
+    if (p->stats_n == 0) {
+        return;
+    }
+    GGML_LOG_INFO("AR stats %s: %llu calls, %.1f MB, wait dev0 %.1f ms, dev1 %.1f ms (%.3f / %.3f ms per call)\n",
+                  tag, (unsigned long long) p->stats_n, p->stats_bytes / 1e6,
+                  p->stats_ms[0], p->stats_ms[1],
+                  p->stats_ms[0] / p->stats_n, p->stats_ms[1] / p->stats_n);
+    p->stats_n = 0;
+    p->stats_bytes = 0;
+    for (int i = 0; i < p->n_devices; ++i) {
+        p->stats_ms[i] = 0.0;
+    }
+}
+
+bool ggml_cuda_ar_allreduce(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        ggml_tensor           ** tensors) {
+    GGML_ASSERT(p != nullptr);
+    if (p->stats_every == 0) {
+        return ggml_cuda_ar_allreduce_impl(p, backends, tensors);
+    }
+    const int ring = (int) (p->stats_n % 4);
+    ggml_cuda_ar_stats_flush(p, ring);
+    for (int i = 0; i < p->n_devices; ++i) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaEventRecord(p->stats_t0[i][ring], cuda_ctx->stream()));
+    }
+    const bool ok = ggml_cuda_ar_allreduce_impl(p, backends, tensors);
+    const int last_slot = (int) ((p->call_count + GGML_CUDA_AR_POOL_SIZE - 1) % GGML_CUDA_AR_POOL_SIZE);
+    for (int i = 0; i < p->n_devices; ++i) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        ggml_cuda_set_device(p->devices[i]);
+        // il percorso a kernel puo' aver lavorato sullo stream dell'AR: lo stream di calcolo aspetta la fine
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), p->ev_pool[i][last_slot].ker));
+        CUDA_CHECK(cudaEventRecord(p->stats_t1[i][ring], cuda_ctx->stream()));
+    }
+    p->stats_valid[ring] = true;
+    p->stats_n++;
+    p->stats_bytes += ggml_nbytes(tensors[0]);
+    if (p->stats_n % p->stats_every == 0) {
+        ggml_cuda_ar_stats_print(p, "period");
+    }
     return ok;
 }
 
