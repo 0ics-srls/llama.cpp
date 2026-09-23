@@ -1,3 +1,6 @@
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend.h"
@@ -2437,12 +2440,35 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    // GGML_META_STATS=N: quanto calcola e quanto aspetta ogni GPU (stampa ogni N grafi)
+    static const uint64_t meta_stats_every = []() -> uint64_t {
+        const char * env = getenv("GGML_META_STATS");
+        return env && env[0] ? strtoull(env, nullptr, 10) : 0;
+    }();
+    static uint64_t meta_stats_n_graphs = 0;
+    static uint64_t meta_stats_n_sub    = 0;
+    static double   meta_stats_busy[GGML_BACKEND_META_MAX_DEVICES] = {};
+    static double   meta_stats_wait[GGML_BACKEND_META_MAX_DEVICES] = {};
+    static double   meta_stats_total = 0.0;
+    auto meta_now = []() -> double {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    double meta_t_done[GGML_BACKEND_META_MAX_DEVICES] = {};
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        const double meta_t0 = meta_stats_every ? meta_now() : 0.0;
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
+            }
+        }
+        if (meta_stats_every) {
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+                meta_t_done[j] = meta_now();
+                meta_stats_busy[j] += meta_t_done[j] - meta_t0;
             }
         }
 
@@ -2464,6 +2490,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
+            }
+        }
+        if (meta_stats_every) {
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+            }
+            const double t_end = meta_now();
+            for (size_t j = 0; j < n_backends; j++) {
+                meta_stats_wait[j] += t_end - meta_t_done[j];
+            }
+            meta_stats_total += t_end - meta_t0;
+            meta_stats_n_sub++;
+        }
+    }
+    if (meta_stats_every) {
+        meta_stats_n_graphs++;
+        if (meta_stats_n_graphs % meta_stats_every == 0 && meta_stats_total > 0.0) {
+            char buf[512];
+            int pos = snprintf(buf, sizeof(buf), "META stats: %llu graphs, %llu subgraphs, %.0f ms:",
+                (unsigned long long) meta_stats_n_graphs, (unsigned long long) meta_stats_n_sub, meta_stats_total);
+            for (size_t j = 0; j < n_backends && pos < (int) sizeof(buf); j++) {
+                pos += snprintf(buf + pos, sizeof(buf) - pos, " dev%zu busy %.0f ms (%.0f%%) wait %.0f ms;",
+                    j, meta_stats_busy[j], 100.0 * meta_stats_busy[j] / meta_stats_total, meta_stats_wait[j]);
+            }
+            GGML_LOG_INFO("%s\n", buf);
+            meta_stats_n_sub = 0;
+            meta_stats_total = 0.0;
+            for (size_t j = 0; j < n_backends; j++) {
+                meta_stats_busy[j] = 0.0;
+                meta_stats_wait[j] = 0.0;
             }
         }
     }
