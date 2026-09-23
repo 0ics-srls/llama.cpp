@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <limits>
 
 // ---------------------------------------------------------------------------
@@ -241,6 +242,64 @@ static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 1024 * 1024; // 1 MB
 // dev_tmp allocation size.
 static constexpr size_t GGML_CUDA_AR_COPY_MAX_BYTES = 32 * 1024 * 1024; // 32 MB
 
+// ---------------------------------------------------------------------------
+// Filo a 8 bit (GGML_CUDA_AR_WIRE=q8): layout del buffer sul filo per una matrice [ne0, nrows] f32:
+//   [int8 q[ne0*nrows]] [pad a 16] [float scale[nrows]]
+// scale = absmax(riga)/127, q = round(x/scale). Un blocco per riga.
+// ---------------------------------------------------------------------------
+static __global__ void ggml_cuda_ar_quant_q8_kernel(
+        const float * __restrict__ x, int8_t * __restrict__ q, float * __restrict__ scale, const int ne0) {
+    const int row = blockIdx.x;
+    const float * xr = x + (size_t) row * ne0;
+    int8_t * qr = q + (size_t) row * ne0;
+
+    float amax = 0.0f;
+    for (int i = threadIdx.x; i < ne0; i += blockDim.x) {
+        amax = fmaxf(amax, fabsf(xr[i]));
+    }
+    __shared__ float red[32];
+    for (int off = 16; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+    }
+    if ((threadIdx.x & 31) == 0) {
+        red[threadIdx.x >> 5] = amax;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        amax = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+        }
+        if (threadIdx.x == 0) {
+            red[0] = amax;
+        }
+    }
+    __syncthreads();
+    amax = red[0];
+    const float sc  = amax / 127.0f;
+    const float isc = sc > 0.0f ? 1.0f / sc : 0.0f;
+    for (int i = threadIdx.x; i < ne0; i += blockDim.x) {
+        qr[i] = (int8_t) __float2int_rn(xr[i] * isc);
+    }
+    if (threadIdx.x == 0) {
+        scale[row] = sc;
+    }
+}
+
+// dst = deq(q_mine) + deq(q_peer): i due valori quantizzati sono gli stessi su entrambe le GPU,
+// quindi la somma e' identica bit a bit.
+static __global__ void ggml_cuda_ar_add_q8_kernel(
+        float * __restrict__ dst, const int8_t * __restrict__ q_mine, const int8_t * __restrict__ q_peer,
+        const int ne0, const size_t scale_off) {
+    const int row = blockIdx.x;
+    const float s_mine = *reinterpret_cast<const float *>(reinterpret_cast<const char *>(q_mine) + scale_off + (size_t) row * sizeof(float));
+    const float s_peer = *reinterpret_cast<const float *>(reinterpret_cast<const char *>(q_peer) + scale_off + (size_t) row * sizeof(float));
+    const size_t base = (size_t) row * ne0;
+    for (int i = threadIdx.x; i < ne0; i += blockDim.x) {
+        dst[base + i] = (float) q_mine[base + i] * s_mine + (float) q_peer[base + i] * s_peer;
+    }
+}
+
 // AR wire size at which the copy-engine path takes over from the chunked-
 // kernel path.  Override via GGML_CUDA_AR_COPY_THRESHOLD.
 static constexpr size_t GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT = 1024 * 1024; // 1 MB
@@ -336,6 +395,10 @@ struct ggml_cuda_ar_pipeline {
     // il buffer (pre_slot), ev.ker registrati sullo stream dell'AR (ker_valid) per la barriera.
     bool                     async_add;
     int                      pre_slot;
+    // filo a 8 bit (GGML_CUDA_AR_WIRE=q8): geometria della chiamata in corso
+    bool                     wire_q8;
+    int                      wire_ne0;
+    size_t                   wire_scale_off;
     char *                   bf16_wire[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE];
     bool                     ker_valid[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE];
 
@@ -456,6 +519,13 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
     p->stats_every      = ggml_cuda_ar_env_u64("GGML_CUDA_AR_STATS", 0);
     p->async_add        = ggml_cuda_ar_env_u64("GGML_CUDA_AR_ASYNC_ADD", 0) != 0;
+    {
+        const char * wire = getenv("GGML_CUDA_AR_WIRE");
+        p->wire_q8 = wire != nullptr && strcmp(wire, "q8") == 0;
+        if (p->wire_q8) {
+            GGML_LOG_INFO("%s: filo a 8 bit (int8 + scala per riga) per il percorso copy-engine\n", __func__);
+        }
+    }
     p->pre_slot         = -1;
     if (p->async_add) {
         GGML_LOG_INFO("%s: async AllReduce (somma sullo stream dell'AR, %d slot in volo)\n", __func__, GGML_CUDA_AR_POOL_SIZE);
@@ -760,10 +830,20 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         if (n_blocks > 1024) {
             n_blocks = 1024;
         }
-        ggml_cuda_ar_add_kernel<T_dst, T_src><<<n_blocks, block_size, 0, add_stream>>>(
-            dst_buf[i],
-            reinterpret_cast<const T_src *>(p->dev_tmp[i]),
-            (int) ne);
+        if constexpr (std::is_same<T_src, int8_t>::value) {
+            // filo a 8 bit: ne qui sono i BYTE del buffer sul filo; la geometria sta in p->wire_*
+            const int nrows = (int) ((p->wire_scale_off) / (size_t) p->wire_ne0);
+            ggml_cuda_ar_add_q8_kernel<<<nrows, block_size, 0, add_stream>>>(
+                reinterpret_cast<float *>(dst_buf[i]),
+                reinterpret_cast<const int8_t *>(src_buf[i]),
+                reinterpret_cast<const int8_t *>(p->dev_tmp[i]),
+                p->wire_ne0, p->wire_scale_off);
+        } else {
+            ggml_cuda_ar_add_kernel<T_dst, T_src><<<n_blocks, block_size, 0, add_stream>>>(
+                dst_buf[i],
+                reinterpret_cast<const T_src *>(p->dev_tmp[i]),
+                (int) ne);
+        }
         CUDA_CHECK(cudaGetLastError());
 
         // Record dev_tmp-released on the compute stream so the next copy_impl
@@ -876,6 +956,52 @@ static bool ggml_cuda_ar_allreduce_impl(
     // inline as it writes to host_buf.
     ggml_cuda_pool_alloc<nv_bfloat16> bf16_tmp[GGML_CUDA_MAX_DEVICES];
     void * copy_src_ptr[GGML_CUDA_MAX_DEVICES] = {};
+
+    // filo a 8 bit: solo copy-engine, input f32, righe intere, buffer entro copy_bytes
+    {
+        const int64_t ne0   = tensors[0]->ne[0];
+        const int64_t nrows = ne0 > 0 ? ne / ne0 : 0;
+        const size_t  q_off = ((size_t) ne + 15) / 16 * 16;
+        const size_t  wire_nbytes = (q_off + (size_t) nrows * sizeof(float) + 15) / 16 * 16;
+        const bool use_q8 = p->wire_q8 && use_copy_engine && input_type == GGML_TYPE_F32 &&
+            ne0 > 0 && ne % ne0 == 0 && ne0 % 4 == 0 && wire_nbytes <= p->copy_bytes;
+        if (use_q8) {
+            p->wire_ne0       = (int) ne0;
+            p->wire_scale_off = q_off;
+            if (p->async_add) {
+                p->pre_slot = ggml_cuda_ar_acquire_slot(p).slot;
+            }
+            ggml_cuda_pool_alloc<char> q8_tmp[GGML_CUDA_MAX_DEVICES];
+            int8_t * src[GGML_CUDA_MAX_DEVICES] = {};
+            float  * dst[GGML_CUDA_MAX_DEVICES] = {};
+            bool inner_compute[GGML_CUDA_MAX_DEVICES];
+            for (int i = 0; i < n; ++i) {
+                auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+                GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+                char * wire = nullptr;
+                if (p->async_add) {
+                    wire = p->bf16_wire[i][p->pre_slot];
+                } else {
+                    q8_tmp[i].pool = &cuda_ctx->pool();
+                    q8_tmp[i].alloc(wire_nbytes);
+                    wire = q8_tmp[i].get();
+                }
+                ggml_cuda_set_device(p->devices[i]);
+                if (compute_flag[i]) {
+                    ggml_cuda_ar_quant_q8_kernel<<<(int) nrows, 256, 0, cuda_ctx->stream()>>>(
+                        static_cast<const float *>(tensors[i]->data), reinterpret_cast<int8_t *>(wire),
+                        reinterpret_cast<float *>(wire + q_off), (int) ne0);
+                    CUDA_CHECK(cudaGetLastError());
+                } else {
+                    CUDA_CHECK(cudaMemsetAsync(wire, 0, wire_nbytes, cuda_ctx->stream()));
+                }
+                src[i] = reinterpret_cast<int8_t *>(wire);
+                dst[i] = static_cast<float *>(tensors[i]->data);
+                inner_compute[i] = true;
+            }
+            return ggml_cuda_ar_allreduce_copy_outer<int8_t, float>(p, backends, src, dst, inner_compute, (int64_t) wire_nbytes);
+        }
+    }
 
     // async: il buffer sul filo e' persistente per slot, e lo slot va acquisito PRIMA di scriverci
     // (acquire_slot aspetta che l'AR di 4 chiamate fa abbia finito di leggerlo)
