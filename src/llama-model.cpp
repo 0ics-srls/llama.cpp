@@ -817,6 +817,38 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
+        // volta-ada: LLAMA_TENSOR_SPLIT_ATTN="a,b,..." = proporzione a parte per i tensori dell'attenzione piena
+        // (tutti quelli che riferiscono il loro asse 0 a attn_output.weight: q/k/v/o, norme, sinks, KV cache).
+        // Serve quando una scheda e' molto piu' veloce nell'attenzione a contesto lungo ma ha meno VRAM.
+        {
+            static const std::vector<float> tensor_split_attn = []() {
+                std::vector<float> ret;
+                const char * env = getenv("LLAMA_TENSOR_SPLIT_ATTN");
+                if (env == nullptr || env[0] == '\0') {
+                    return ret;
+                }
+                std::string str(env);
+                size_t pos = 0;
+                while (pos <= str.size()) {
+                    const size_t next = str.find(',', pos);
+                    const std::string tok = str.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+                    ret.push_back(tok.empty() ? 0.0f : std::stof(tok));
+                    if (next == std::string::npos) {
+                        break;
+                    }
+                    pos = next + 1;
+                }
+                while (ret.size() < GGML_BACKEND_META_MAX_DEVICES) {
+                    ret.push_back(0.0f);
+                }
+                LLAMA_LOG_INFO("%s: LLAMA_TENSOR_SPLIT_ATTN = %s (attenzione piena divisa a parte)\n", __func__, env);
+                return ret;
+            }();
+            if (!tensor_split_attn.empty() && tc.tensor_axis_0 != nullptr &&
+                    std::string(tc.tensor_axis_0->name).find("attn_output.weight") != std::string::npos) {
+                tensor_split = tensor_split_attn.data();
+            }
+        }
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
