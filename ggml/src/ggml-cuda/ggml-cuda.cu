@@ -1257,6 +1257,26 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
+// AR asincrono (vedi allreduce.cu): il meta backend chiede se e' attivo e mette la barriera
+// prima di usare i risultati.
+static bool ggml_backend_cuda_comm_allreduce_async(void * comm_ctx_v) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    return comm_ctx->ar_pipeline != nullptr && ggml_cuda_ar_async(comm_ctx->ar_pipeline);
+}
+
+static void ggml_backend_cuda_comm_fence(void * comm_ctx_v) {
+    if (comm_ctx_v == nullptr) {
+        return;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->ar_pipeline != nullptr) {
+        ggml_cuda_ar_fence(comm_ctx->ar_pipeline, comm_ctx->backends.data());
+    }
+}
+
 // host buffer type
 
 static const char * ggml_backend_cuda_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -5753,6 +5773,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_async") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_async;
+    }
+    if (strcmp(name, "ggml_backend_comm_fence") == 0) {
+        return (void *)ggml_backend_cuda_comm_fence;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

@@ -1787,6 +1787,11 @@ struct ggml_backend_meta_context {
         int           offset      = 0; // Node offset vs. original graph
 
         std::vector<ggml_cgraph *> cgraphs_aux;
+
+        // AR a fette: l'ultima matmul del sottografo spezzata in fette di token (chunk_nodes[0] sta
+        // gia' in cgraph_main al posto dell'originale, le altre in chunk_graphs[c-1], un nodo ciascuno)
+        std::vector<ggml_tensor *> chunk_nodes;
+        std::vector<ggml_cgraph *> chunk_graphs;
     };
     struct backend_config {
         ggml_backend_t backend;
@@ -1813,6 +1818,14 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+
+    // AR a fette sovrapposto al calcolo (GGML_META_AR_CHUNKS=N, serve l'AR asincrono del backend)
+    typedef void (*comm_fence_t)(void * comm_ctx);
+    typedef bool (*comm_async_t)(void * comm_ctx);
+    comm_fence_t                         comm_fence = nullptr;
+    size_t                               n_chunks   = 0;
+    std::vector<bool>                    chunked;
+    ggml_context_ptr                     ctx_chunks;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -1844,6 +1857,20 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+
+            ggml_backend_reg_t reg0 = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+            comm_async_t comm_async = (comm_async_t) ggml_backend_reg_get_proc_address(reg0, "ggml_backend_comm_allreduce_async");
+            comm_fence = (comm_fence_t) ggml_backend_reg_get_proc_address(reg0, "ggml_backend_comm_fence");
+            const char * env_chunks = getenv("GGML_META_AR_CHUNKS");
+            const size_t want = env_chunks && env_chunks[0] ? (size_t) strtoull(env_chunks, nullptr, 10) : 0;
+            if (want > 1) {
+                if (n_devs == 2 && comm_async && comm_fence && comm_async(comm_ctx)) {
+                    n_chunks = want;
+                    GGML_LOG_INFO("%s: AllReduce a fette sovrapposto al calcolo: %zu fette per sottografo\n", __func__, n_chunks);
+                } else {
+                    GGML_LOG_WARN("%s: GGML_META_AR_CHUNKS ignorato (servono 2 GPU e GGML_CUDA_AR_ASYNC_ADD=1)\n", __func__);
+                }
+            }
         }
     }
 
@@ -2292,6 +2319,106 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 cgraph_ij->uid = ggml_graph_next_uid();
             }
         }
+
+        // AR a fette: l'ultima matmul di ogni sottografo (tranne l'ultimo, che non ha AR) spezzata in
+        // n_chunks fette di token, cosi' l'AllReduce di una fetta viaggia mentre la fetta dopo calcola.
+        backend_ctx->chunked.assign(n_subgraphs, false);
+        if (backend_ctx->n_chunks > 1 && n_subgraphs > 1) {
+            const size_t nc = backend_ctx->n_chunks;
+            const size_t n_tensors = n_subgraphs * n_backends * nc * 2;
+            const size_t n_graphs  = n_subgraphs * n_backends * nc;
+            const ggml_init_params cparams = {
+                /*.mem_size   =*/ n_tensors*ggml_tensor_overhead() + n_graphs*ggml_graph_overhead_custom(1, false) + 1024*1024,
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            backend_ctx->ctx_chunks.reset(ggml_init(cparams));
+            ggml_context * cctx = backend_ctx->ctx_chunks.get();
+            for (size_t i = 0; i + 1 < n_subgraphs; i++) {
+                bool ok = true;
+                for (size_t j = 0; j < n_backends && ok; j++) {
+                    ggml_cgraph * g = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
+                    if (g->n_nodes < 1) {
+                        ok = false;
+                        break;
+                    }
+                    const ggml_tensor * P = g->nodes[g->n_nodes - 1];
+                    const ggml_tensor * S = P->src[1];
+                    if (P->op != GGML_OP_MUL_MAT || P->type != GGML_TYPE_F32 || !ggml_is_contiguous(P) ||
+                            P->view_src != nullptr || P->ne[2] != 1 || P->ne[3] != 1 ||
+                            S == nullptr || S->ne[2] != 1 || S->ne[3] != 1 || S->ne[1] != P->ne[1] ||
+                            P->ne[1] < (int64_t) (nc * 32) || P->buffer == nullptr || S->buffer == nullptr) {
+                        ok = false;
+                    }
+                }
+                if (!ok) {
+                    continue;
+                }
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & cg = backend_ctx->backend_configs[j].cgraphs[i];
+                    ggml_cgraph * g = cg.cgraph_main;
+                    ggml_tensor * P = g->nodes[g->n_nodes - 1];
+                    ggml_tensor * S = P->src[1];
+                    const int64_t nt   = P->ne[1];
+                    const int64_t step = ((nt + (int64_t) nc - 1) / (int64_t) nc + 31) / 32 * 32;
+                    cg.chunk_nodes.clear();
+                    cg.chunk_graphs.clear();
+                    for (size_t c = 0; c < nc; c++) {
+                        const int64_t t0 = std::min<int64_t>((int64_t) c * step, nt);
+                        const int64_t t1 = std::min<int64_t>((int64_t) (c + 1) * step, nt);
+                        const int64_t n  = t1 - t0;
+                        if (n <= 0) {
+                            break;
+                        }
+                        ggml_tensor * s = ggml_new_tensor_2d(cctx, S->type, S->ne[0], n);
+                        s->nb[0] = S->nb[0];
+                        s->nb[1] = S->nb[1];
+                        s->nb[2] = S->nb[1] * n;
+                        s->nb[3] = s->nb[2];
+                        s->data      = (char *) S->data + t0 * S->nb[1];
+                        s->buffer    = S->buffer;
+                        s->view_src  = S;
+                        s->view_offs = t0 * S->nb[1];
+                        s->flags     = S->flags;
+                        ggml_format_name(s, "%s.c%zu", S->name, c);
+
+                        ggml_tensor * m = ggml_new_tensor_2d(cctx, P->type, P->ne[0], n);
+                        m->op     = GGML_OP_MUL_MAT;
+                        m->src[0] = P->src[0];
+                        m->src[1] = s;
+                        m->nb[0]  = P->nb[0];
+                        m->nb[1]  = P->nb[1];
+                        m->nb[2]  = P->nb[1] * n;
+                        m->nb[3]  = m->nb[2];
+                        m->data   = (char *) P->data + t0 * P->nb[1];
+                        m->buffer = P->buffer;
+                        m->flags  = P->flags;
+                        memcpy(m->op_params, P->op_params, sizeof(P->op_params));
+                        ggml_format_name(m, "%s.c%zu", P->name, c);
+                        cg.chunk_nodes.push_back(m);
+
+                        if (c == 0) {
+                            g->nodes[g->n_nodes - 1] = m;
+                            const size_t hp = ggml_hash_insert(&g->visited_hash_set, m);
+                            if (hp != GGML_HASHSET_FULL && hp != GGML_HASHSET_ALREADY_EXISTS) {
+                                g->use_counts[hp] = 1;
+                            }
+                        } else {
+                            ggml_cgraph * gc = ggml_new_graph_custom(cctx, 1, false);
+                            gc->nodes[0] = m;
+                            gc->n_nodes  = 1;
+                            const size_t hp = ggml_hash_insert(&gc->visited_hash_set, m);
+                            if (hp != GGML_HASHSET_FULL && hp != GGML_HASHSET_ALREADY_EXISTS) {
+                                gc->use_counts[hp] = 1;
+                            }
+                            gc->uid = ggml_graph_next_uid();
+                            cg.chunk_graphs.push_back(gc);
+                        }
+                    }
+                }
+                backend_ctx->chunked[i] = true;
+            }
+        }
     }
 
     size_t iga = 0; // i graph aux
@@ -2457,6 +2584,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         const double meta_t0 = meta_stats_every ? meta_now() : 0.0;
+        if (backend_ctx->n_chunks > 1 && i < backend_ctx->chunked.size() && backend_ctx->chunked[i] &&
+                backend_ctx->comm_ctx != nullptr && n_backends == 2) {
+            // AR a fette: calcola la fetta c, lancia il suo AllReduce (asincrono), passa alla fetta c+1
+            const size_t nc = backend_ctx->backend_configs[0].cgraphs[i].chunk_nodes.size();
+            for (size_t c = 0; c < nc; c++) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    ggml_cgraph * g = c == 0 ? bcj.cgraphs[i].cgraph_main : bcj.cgraphs[i].chunk_graphs[c - 1];
+                    const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, g);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                }
+                ggml_tensor * nodes[GGML_BACKEND_META_MAX_DEVICES];
+                for (size_t j = 0; j < n_backends; j++) {
+                    nodes[j] = backend_ctx->backend_configs[j].cgraphs[i].chunk_nodes[c];
+                }
+                if (!backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes)) {
+                    GGML_ABORT("AllReduce a fette fallito (GGML_META_AR_CHUNKS)");
+                }
+            }
+            backend_ctx->comm_fence(backend_ctx->comm_ctx);
+            continue;
+        }
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
