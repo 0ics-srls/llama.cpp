@@ -899,7 +899,7 @@ static bool ggml_cuda_ar_allreduce_impl(
             }
             ggml_cuda_set_device(p->devices[i]);
             if (compute_flag[i]) {
-                to_bf16(tensors[i]->data, wire, ne, cuda_ctx->stream());
+                to_bf16(tensors[i]->data, static_cast<nv_bfloat16 *>(wire), ne, cuda_ctx->stream());
                 CUDA_CHECK(cudaGetLastError());
             } else {
                 CUDA_CHECK(cudaMemsetAsync(wire, 0, nbytes, cuda_ctx->stream()));
