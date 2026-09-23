@@ -2352,6 +2352,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                 }
                 if (!ok) {
+                    static const bool dbg = getenv("GGML_META_AR_DEBUG") != nullptr;
+                    if (dbg) {
+                        ggml_cgraph * g = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+                        const ggml_tensor * P = g->n_nodes > 0 ? g->nodes[g->n_nodes - 1] : nullptr;
+                        GGML_LOG_INFO("%s: sottografo %zu non spezzato: ultimo nodo %s op=%s type=%s ne=[%lld,%lld,%lld] cont=%d view=%d src1=%s\n",
+                            __func__, i, P ? P->name : "-", P ? ggml_op_name(P->op) : "-", P ? ggml_type_name(P->type) : "-",
+                            P ? (long long) P->ne[0] : 0, P ? (long long) P->ne[1] : 0, P ? (long long) P->ne[2] : 0,
+                            P ? (int) ggml_is_contiguous(P) : 0, P ? (int) (P->view_src != nullptr) : 0,
+                            P && P->src[1] ? P->src[1]->name : "-");
+                    }
                     continue;
                 }
                 for (size_t j = 0; j < n_backends; j++) {
@@ -2418,6 +2428,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 backend_ctx->chunked[i] = true;
             }
+            size_t n_chunked = 0;
+            for (size_t i = 0; i < n_subgraphs; i++) {
+                n_chunked += backend_ctx->chunked[i] ? 1 : 0;
+            }
+            GGML_LOG_INFO("%s: AR a fette: %zu sottografi su %zu spezzati (nodi=%d)\n", __func__, n_chunked, n_subgraphs, cgraph->n_nodes);
         }
     }
 
