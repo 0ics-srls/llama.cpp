@@ -1180,6 +1180,102 @@ static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
     return (void *) 0x1000000000000000; // FIXME
 }
 
+// --- volta-ada: cache KV con tipo per scheda (GGML_META_KV_TYPES="q8_0,f16") ---------------------------
+static const std::vector<ggml_type> & ggml_backend_meta_kv_types() {
+    static const std::vector<ggml_type> types = []() {
+        std::vector<ggml_type> ret;
+        const char * env = getenv("GGML_META_KV_TYPES");
+        if (env == nullptr || env[0] == '\0') {
+            return ret;
+        }
+        std::string str(env);
+        size_t pos = 0;
+        while (pos <= str.size()) {
+            const size_t next = str.find(',', pos);
+            const std::string tok = str.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+            ggml_type t = GGML_TYPE_COUNT;
+            for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+                const char * name = ggml_type_name((ggml_type) i);
+                if (name != nullptr && tok == name) {
+                    t = (ggml_type) i;
+                    break;
+                }
+            }
+            GGML_ASSERT(t != GGML_TYPE_COUNT && "GGML_META_KV_TYPES: tipo sconosciuto");
+            ret.push_back(t);
+            if (next == std::string::npos) {
+                break;
+            }
+            pos = next + 1;
+        }
+        GGML_LOG_INFO("%s: cache KV con tipo per scheda: %s\n", __func__, env);
+        return ret;
+    }();
+    return types;
+}
+
+static bool ggml_backend_meta_is_kv_cache_tensor(const ggml_tensor * tensor) {
+    const char * n = tensor->name;
+    // cache_k_l%d, cache_v_l%d, e le varianti con tag (cache_swa_k_l%d); non gli stati ricorrenti (cache_r_l, cache_s_l)
+    return strncmp(n, "cache_", 6) == 0 && (strstr(n, "k_l") != nullptr || strstr(n, "v_l") != nullptr) && tensor->view_src == nullptr;
+}
+
+// byte nel tipo "from" -> byte nel tipo "to" per lo stesso numero di elementi (stride e offset)
+static size_t ggml_backend_meta_conv_bytes(size_t bytes, ggml_type from, ggml_type to) {
+    if (from == to || bytes == 0) {
+        return bytes;
+    }
+    const size_t ts_from = ggml_type_size(from), bs_from = ggml_blck_size(from);
+    const size_t ts_to   = ggml_type_size(to),   bs_to   = ggml_blck_size(to);
+    GGML_ASSERT(bytes % ts_from == 0);
+    const size_t elems = bytes / ts_from * bs_from;
+    GGML_ASSERT(elems % bs_to == 0);
+    return elems / bs_to * ts_to;
+}
+
+// tipo della fetta j di un tensore: la cache KV segue GGML_META_KV_TYPES, le viste seguono la sorgente
+static ggml_type ggml_backend_meta_slice_type(const ggml_tensor * tensor, size_t j) {
+    const auto & types = ggml_backend_meta_kv_types();
+    if (types.empty()) {
+        return tensor->type;
+    }
+    if (ggml_backend_meta_is_kv_cache_tensor(tensor)) {
+        return j < types.size() ? types[j] : tensor->type;
+    }
+    if (tensor->view_src != nullptr && tensor->view_src->buffer != nullptr && ggml_backend_buffer_is_meta(tensor->view_src->buffer)) {
+        const ggml_tensor * src_j = ggml_backend_meta_buffer_simple_tensor(tensor->view_src, j);
+        if (src_j != nullptr && src_j->type != tensor->view_src->type && tensor->type == tensor->view_src->type) {
+            return src_j->type;
+        }
+    }
+    return tensor->type;
+}
+
+// righe di un tipo -> righe di un altro tipo, passando per f32 (per salvare/ripristinare lo slot)
+static void ggml_backend_meta_convert_rows(const void * src, ggml_type src_type, void * dst, ggml_type dst_type, int64_t n_elems) {
+    if (src_type == dst_type) {
+        memcpy(dst, src, ggml_row_size(src_type, n_elems));
+        return;
+    }
+    std::vector<float> tmp(n_elems);
+    if (src_type == GGML_TYPE_F32) {
+        memcpy(tmp.data(), src, n_elems * sizeof(float));
+    } else {
+        const auto * traits = ggml_get_type_traits(src_type);
+        GGML_ASSERT(traits->to_float != nullptr);
+        traits->to_float(src, tmp.data(), n_elems);
+    }
+    if (dst_type == GGML_TYPE_F32) {
+        memcpy(dst, tmp.data(), n_elems * sizeof(float));
+    } else if (dst_type == GGML_TYPE_F16) {
+        ggml_fp32_to_fp16_row(tmp.data(), (ggml_fp16_t *) dst, n_elems);
+    } else if (dst_type == GGML_TYPE_BF16) {
+        ggml_fp32_to_bf16_row(tmp.data(), (ggml_bf16_t *) dst, n_elems);
+    } else {
+        ggml_quantize_chunk(dst_type, tmp.data(), dst, 0, 1, n_elems, nullptr);
+    }
+}
+
 static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
@@ -1217,11 +1313,28 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             }
         }
 
-        ggml_tensor * t_ij = ggml_new_tensor(simple_ctx, tensor->type, GGML_MAX_DIMS, ne);
+        const ggml_type type_j = ggml_backend_meta_slice_type(tensor, j);
+        ggml_tensor * t_ij = ggml_new_tensor(simple_ctx, type_j, GGML_MAX_DIMS, ne);
         t_ij->op = tensor->op;
-        for (int i = 0; i < GGML_MAX_DIMS; i++) {
-            t_ij->nb[i] = nb[i];
+        if (type_j == tensor->type) {
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                t_ij->nb[i] = nb[i];
+            }
+        } else if (tensor->view_src == nullptr) {
+            // fetta statica (la cache stessa): stride contigui nel tipo della scheda
+            t_ij->nb[0] = ggml_type_size(type_j);
+            t_ij->nb[1] = ggml_row_size(type_j, ne[0]);
+            for (int i = 2; i < GGML_MAX_DIMS; i++) {
+                t_ij->nb[i] = t_ij->nb[i-1] * ne[i-1];
+            }
+        } else {
+            // vista: gli stride in byte del tipo meta vanno riconvertiti nel tipo della fetta
+            t_ij->nb[0] = ggml_type_size(type_j);
+            for (int i = 1; i < GGML_MAX_DIMS; i++) {
+                t_ij->nb[i] = ggml_backend_meta_conv_bytes(nb[i], tensor->type, type_j);
+            }
         }
+        const bool type_converted = type_j != tensor->type;
         t_ij->flags = tensor->flags;
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
         ggml_set_name(t_ij, tensor->name);
@@ -1248,6 +1361,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 if (!split_internal_offset) {
                     t_ij->view_offs = t_ij->view_offs * ne[split_dim]/tensor->ne[split_dim];
                 }
+            }
+            if (type_converted) {
+                t_ij->view_offs = ggml_backend_meta_conv_bytes(t_ij->view_offs, tensor->type, type_j);
             }
         }
         // TODO: revisit once the graph allocator has been refactored, see https://github.com/ggml-org/llama.cpp/pull/25051#issuecomment-4842873396
@@ -1451,9 +1567,23 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                         ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                         GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
                         const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
-                        ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
-                            simple_offsets[j] + row_start * simple_tensor->nb[1], nbytes,
-                            row_count, simple_tensor->nb[1], tensor->nb[1]);
+                        if (simple_tensor->type != tensor->type) {
+                            // volta-ada: fetta in un altro tipo: converto le righe (host, via f32) e le scrivo in un colpo
+                            const int64_t n_el   = split_state.ne[s*n_bufs + j];
+                            const size_t  nb_j   = ggml_row_size(simple_tensor->type, n_el);
+                            std::vector<char> tmp(nb_j * row_count);
+                            for (int64_t r_i = 0; r_i < row_count; r_i++) {
+                                ggml_backend_meta_convert_rows((const char *) data + offset_data + r_i * tensor->nb[1], tensor->type,
+                                                               tmp.data() + r_i * nb_j, simple_tensor->type, n_el);
+                            }
+                            ggml_backend_tensor_set_2d(simple_tensor, tmp.data(),
+                                ggml_backend_meta_conv_bytes(simple_offsets[j], tensor->type, simple_tensor->type) + row_start * simple_tensor->nb[1],
+                                nb_j, row_count, simple_tensor->nb[1], nb_j);
+                        } else {
+                            ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
+                                simple_offsets[j] + row_start * simple_tensor->nb[1], nbytes,
+                                row_count, simple_tensor->nb[1], tensor->nb[1]);
+                        }
                         offset_data       += nbytes;
                         simple_offsets[j] += nbytes;
                     }
@@ -1579,9 +1709,23 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
                         const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                         GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
                         const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
-                        ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_data,
-                            simple_offsets[j] + row_start * simple_tensor->nb[1], nbytes,
-                            row_count, simple_tensor->nb[1], tensor->nb[1]);
+                        if (simple_tensor->type != tensor->type) {
+                            // volta-ada: fetta in un altro tipo: leggo in un colpo e converto le righe (host, via f32)
+                            const int64_t n_el   = split_state.ne[s*n_bufs + j];
+                            const size_t  nb_j   = ggml_row_size(simple_tensor->type, n_el);
+                            std::vector<char> tmp(nb_j * row_count);
+                            ggml_backend_tensor_get_2d(simple_tensor, tmp.data(),
+                                ggml_backend_meta_conv_bytes(simple_offsets[j], tensor->type, simple_tensor->type) + row_start * simple_tensor->nb[1],
+                                nb_j, row_count, simple_tensor->nb[1], nb_j);
+                            for (int64_t r_i = 0; r_i < row_count; r_i++) {
+                                ggml_backend_meta_convert_rows(tmp.data() + r_i * nb_j, simple_tensor->type,
+                                                               (char *) data + offset_data + r_i * tensor->nb[1], tensor->type, n_el);
+                            }
+                        } else {
+                            ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_data,
+                                simple_offsets[j] + row_start * simple_tensor->nb[1], nbytes,
+                                row_count, simple_tensor->nb[1], tensor->nb[1]);
+                        }
                         offset_data       += nbytes;
                         simple_offsets[j] += nbytes;
                     }
