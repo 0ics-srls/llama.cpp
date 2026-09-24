@@ -1466,9 +1466,12 @@ static void ggml_backend_meta_buffer_memset_tensor(
                         ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                         GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
                         const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
+                        // volta-ada: fetta in un altro tipo: byte e offset nel tipo della fetta
+                        const size_t nbytes_j = ggml_backend_meta_conv_bytes(nbytes, tensor->type, simple_tensor->type);
+                        const size_t offs_j   = ggml_backend_meta_conv_bytes(simple_offsets[j], tensor->type, simple_tensor->type);
                         for (int64_t row = 0; row < row_count; row++) {
                             ggml_backend_tensor_memset(simple_tensor, value,
-                                    simple_offsets[j] + (row_start + row)*simple_tensor->nb[1], nbytes);
+                                    offs_j + (row_start + row)*simple_tensor->nb[1], nbytes_j);
                         }
                         simple_offsets[j] += nbytes;
                     }
