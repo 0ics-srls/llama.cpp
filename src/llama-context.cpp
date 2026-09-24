@@ -3443,17 +3443,28 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    // il buffer di calcolo di un meta backend viene allocato per intero su OGNI scheda semplice
+    auto add_compute = [&ret](ggml_backend_buffer_type_t buft, size_t size) {
+        if (ggml_backend_buft_is_meta(buft)) {
+            const size_t n = ggml_backend_meta_buft_n_bufts(buft);
+            for (size_t i = 0; i < n; i++) {
+                ret[ggml_backend_meta_buft_simple_buft(buft, i)].compute += size;
+            }
+            return;
+        }
+        ret[buft].compute += size;
+    };
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += backend_buf_exp_size[i];
+            add_compute(buft, backend_buf_exp_size[i]);
         }
     } else {
         for (const auto & backend_ptr : backends) {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            add_compute(buft, ggml_backend_sched_get_buffer_size(sched.get(), backend));
         }
     }
     return ret;
