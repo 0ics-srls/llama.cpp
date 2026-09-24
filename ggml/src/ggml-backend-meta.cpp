@@ -1639,6 +1639,21 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     continue;
                 }
                 const size_t simple_offset = i_start * chunk_size_j;
+                if (simple_tensor->type != tensor->type) {
+                    // volta-ada: fetta in un altro tipo (cache mista): il chunk e' una riga della fetta, si converte via f32
+                    GGML_ASSERT(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0);
+                    const size_t  chunk_full_j = ggml_backend_meta_conv_bytes(chunk_size_j, simple_tensor->type, tensor->type);
+                    const int64_t n_rows = i_stop - i_start;
+                    const int64_t n_el   = (int64_t) (chunk_size_j / ggml_type_size(simple_tensor->type) * ggml_blck_size(simple_tensor->type));
+                    std::vector<char> tmp(chunk_size_j * n_rows);
+                    for (int64_t r = 0; r < n_rows; r++) {
+                        ggml_backend_meta_convert_rows((const char *) data + offset_j + r * chunk_size_full, tensor->type,
+                                                       tmp.data() + r * chunk_size_j, simple_tensor->type, n_el);
+                    }
+                    ggml_backend_tensor_set_2d(simple_tensor, tmp.data(), simple_offset, chunk_size_j, n_rows, chunk_size_j, chunk_size_j);
+                    offset_j += chunk_full_j;
+                    continue;
+                }
                 ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
                 offset_j += chunk_size_j;
             }
@@ -1781,6 +1796,21 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
                     continue;
                 }
                 const size_t simple_offset = i_start * chunk_size_j;
+                if (simple_tensor->type != tensor->type) {
+                    // volta-ada: fetta in un altro tipo (cache mista): il chunk e' una riga della fetta, si converte via f32
+                    GGML_ASSERT(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0);
+                    const size_t  chunk_full_j = ggml_backend_meta_conv_bytes(chunk_size_j, simple_tensor->type, tensor->type);
+                    const int64_t n_rows = i_stop - i_start;
+                    const int64_t n_el   = (int64_t) (chunk_size_j / ggml_type_size(simple_tensor->type) * ggml_blck_size(simple_tensor->type));
+                    std::vector<char> tmp(chunk_size_j * n_rows);
+                    ggml_backend_tensor_get_2d(simple_tensor, tmp.data(), simple_offset, chunk_size_j, n_rows, chunk_size_j, chunk_size_j);
+                    for (int64_t r = 0; r < n_rows; r++) {
+                        ggml_backend_meta_convert_rows(tmp.data() + r * chunk_size_j, simple_tensor->type,
+                                                       (char *) data + offset_j + r * chunk_size_full, tensor->type, n_el);
+                    }
+                    offset_j += chunk_full_j;
+                    continue;
+                }
                 ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
                 offset_j += chunk_size_j;
             }
