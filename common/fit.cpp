@@ -401,7 +401,8 @@ static void common_params_fit_impl(
             }
             return ret;
         };
-        const bool     n_ctx_locked = n_ctx_min == UINT32_MAX;
+        // il contesto lo decide l utente: si tocca solo se era 0 (auto) o se lo ha chiesto lui con -c 0 (= tutto)
+        const bool     n_ctx_locked = n_ctx_min == UINT32_MAX || !n_ctx_auto;
         const uint32_t n_ubatch_min = std::min<uint32_t>(512, n_ubatch_0);
         common_fit_tensor_plan plan = common_fit_tensor_search(
             used_per_dev, free_per_device, margins, n_ctx_0, n_ubatch_0,
@@ -410,10 +411,14 @@ static void common_params_fit_impl(
             LOG_TRC("%s: %s\n", __func__, note.c_str());
         }
         if (!plan.fits) {
+            // niente cambi: si prova a caricare lo stesso, con i numeri della proiezione nel log
             cparams->n_ctx    = n_ctx_0;
-            cparams->n_ubatch = n_ubatch_0;
-            throw common_params_fit_exception("tensor split: no context size / ubatch fits into device memory"
-                + std::string(n_ctx_locked ? " (context size locked by user)" : "") + ", abort");
+            cparams->n_ubatch = plan.n_ubatch;
+            for (const std::string & note : plan.notes) {
+                LOG_WRN("%s: %s\n", __func__, note.c_str());
+            }
+            throw common_params_fit_exception("tensor split: projected not to fit device memory"
+                + std::string(n_ctx_locked ? " (context size set by user, not reduced)" : "") + ", loading anyway");
         }
         cparams->n_ctx    = plan.n_ctx;
         cparams->n_ubatch = plan.n_ubatch;
