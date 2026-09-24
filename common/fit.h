@@ -3,6 +3,8 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <functional>
+#include <string>
 #include <vector>
 
 enum common_params_fit_status {
@@ -44,6 +46,26 @@ void common_fit_print(
                llama_context_params * cparams);
 
 void common_memory_breakdown_print(const llama_context * ctx);
+
+// tensor split: piano trovato dalla ricerca su (n_ctx, n_ubatch)
+struct common_fit_tensor_plan {
+    uint32_t n_ctx    = 0;
+    uint32_t n_ubatch = 0;
+    bool     fits     = false;
+    std::vector<std::string> notes; // passi della ricerca, leggibili
+};
+
+// Ricerca pura (senza modello caricato) per il tensor split: i pesi non si spostano e lo split e' fisso, le leve sono
+// l'ubatch (dimezzato per primo, fino a n_ubatch_min) e poi il contesto (interpolato per scheda fra n_ctx_min e n_ctx,
+// allineato a n_ctx_align, mai sotto n_ctx_min; non toccato se n_ctx_locked). used_per_dev(n_ctx, n_ubatch) restituisce
+// i byte previsti per ogni scheda; entra quando used + margin <= free su tutte.
+common_fit_tensor_plan common_fit_tensor_search(
+    const std::function<std::vector<int64_t>(uint32_t n_ctx, uint32_t n_ubatch)> & used_per_dev,
+    const std::vector<int64_t> & free_per_dev,
+    const std::vector<int64_t> & margins_per_dev,
+    uint32_t n_ctx, uint32_t n_ubatch,
+    uint32_t n_ctx_min, uint32_t n_ctx_align,
+    uint32_t n_ubatch_min, bool n_ctx_locked);
 
 struct common_device_memory_data {
     int64_t total;

@@ -5,6 +5,7 @@
 
 #include "../src/llama-ext.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <stdexcept>
@@ -70,7 +71,19 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to create llama_context from model");
     }
 
-    const size_t nd = llama_model_n_devices(model);
+    // volta-ada: in tensor split il modello ha un solo device (meta): il fit ragiona sulle schede semplici
+    std::vector<ggml_backend_dev_t> model_devs;
+    for (size_t i = 0; i < llama_model_n_devices(model); i++) {
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        if (ggml_backend_dev_is_meta(dev)) {
+            for (size_t j = 0; j < ggml_backend_meta_dev_n_devs(dev); j++) {
+                model_devs.push_back(ggml_backend_meta_dev_simple_dev(dev, j));
+            }
+        } else {
+            model_devs.push_back(dev);
+        }
+    }
+    const size_t nd = model_devs.size();
     std::vector<llama_device_memory_data> ret(nd + 1);
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
@@ -88,7 +101,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             continue;
         }
         for (size_t i = 0; i < nd; i++) {
-            if (dev == llama_model_get_device(model, i)) {
+            if (dev == model_devs[i]) {
                 ret[i].mb.model   += mb.model;
                 ret[i].mb.context += mb.context;
                 ret[i].mb.compute += mb.compute;
@@ -109,7 +122,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ret.back().total = total;
     }
     for (size_t i = 0; i < nd; i++) {
-        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        ggml_backend_dev_t dev = model_devs[i];
 
         size_t free;
         size_t total;
@@ -132,10 +145,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ret[i].total = total;
     }
 
-    devs.clear();
-    for (int i = 0; i < llama_model_n_devices(model); i++) {
-        devs.push_back(llama_model_get_device(model, i));
-    }
+    devs = model_devs;
 
     hp_ngl         = llama_model_n_layer(model);
     if (mparams->load_mtp) {
@@ -180,9 +190,6 @@ static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
-    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
-    }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
     const llama_model_params default_mparams = llama_model_default_params();
@@ -368,6 +375,55 @@ static void common_params_fit_impl(
                 return;
             }
         }
+    }
+
+    // volta-ada: tensor split. I pesi non si spostano e lo split e' fisso: si cercano n_ubatch e n_ctx che entrano.
+    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        if (nd == 0) {
+            throw common_params_fit_exception("tensor split without devices, abort");
+        }
+        std::vector<int64_t> free_per_device;
+        for (size_t id = 0; id < nd; id++) {
+            free_per_device.push_back(dmds_full[id].free);
+        }
+        const uint32_t n_ubatch_0 = cparams->n_ubatch;
+        const uint32_t n_ctx_0    = cparams->n_ctx;
+        auto used_per_dev = [&](uint32_t n_ctx, uint32_t n_ubatch) {
+            cparams->n_ctx    = n_ctx;
+            cparams->n_ubatch = n_ubatch;
+            cparams->n_batch  = std::max(cparams->n_batch, n_ubatch);
+            LOG_TRC("%s: getting device memory data at n_ctx = %" PRIu32 ", n_ubatch = %" PRIu32 ":\n", __func__, n_ctx, n_ubatch);
+            dmds_t dmds = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            add_extra_memory(dmds);
+            std::vector<int64_t> ret;
+            for (size_t id = 0; id < nd; id++) {
+                ret.push_back(dmds[id].mb.total());
+            }
+            return ret;
+        };
+        const bool     n_ctx_locked = n_ctx_min == UINT32_MAX;
+        const uint32_t n_ubatch_min = std::min<uint32_t>(512, n_ubatch_0);
+        common_fit_tensor_plan plan = common_fit_tensor_search(
+            used_per_dev, free_per_device, margins, n_ctx_0, n_ubatch_0,
+            n_ctx_locked ? n_ctx_0 : std::min(n_ctx_min_total, n_ctx_0), 256 * n_streams, n_ubatch_min, n_ctx_locked);
+        for (const std::string & note : plan.notes) {
+            LOG_TRC("%s: %s\n", __func__, note.c_str());
+        }
+        if (!plan.fits) {
+            cparams->n_ctx    = n_ctx_0;
+            cparams->n_ubatch = n_ubatch_0;
+            throw common_params_fit_exception("tensor split: no context size / ubatch fits into device memory"
+                + std::string(n_ctx_locked ? " (context size locked by user)" : "") + ", abort");
+        }
+        cparams->n_ctx    = plan.n_ctx;
+        cparams->n_ubatch = plan.n_ubatch;
+        if (plan.n_ubatch != n_ubatch_0) {
+            LOG_WRN("%s: tensor split: n_ubatch reduced from %" PRIu32 " to %" PRIu32 " to fit device memory\n", __func__, n_ubatch_0, plan.n_ubatch);
+        }
+        if (plan.n_ctx != n_ctx_0) {
+            LOG_WRN("%s: tensor split: context size reduced from %" PRIu32 " to %" PRIu32 " to fit device memory\n", __func__, n_ctx_0, plan.n_ctx);
+        }
+        return;
     }
 
     // step 2: try reducing memory use by reducing the context size
@@ -874,6 +930,106 @@ static void common_params_fit_impl(
     }
 
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+}
+
+common_fit_tensor_plan common_fit_tensor_search(
+        const std::function<std::vector<int64_t>(uint32_t n_ctx, uint32_t n_ubatch)> & used_per_dev,
+        const std::vector<int64_t> & free_per_dev,
+        const std::vector<int64_t> & margins_per_dev,
+        uint32_t n_ctx, uint32_t n_ubatch,
+        uint32_t n_ctx_min, uint32_t n_ctx_align,
+        uint32_t n_ubatch_min, bool n_ctx_locked) {
+    constexpr int64_t MiB = 1024*1024;
+    const size_t nd = free_per_dev.size();
+    GGML_ASSERT(margins_per_dev.size() >= nd);
+    n_ctx_align = std::max<uint32_t>(n_ctx_align, 1);
+    n_ctx_min   = std::min(n_ctx_min, n_ctx);
+
+    common_fit_tensor_plan plan;
+    plan.n_ctx    = n_ctx;
+    plan.n_ubatch = n_ubatch;
+
+    auto fits = [&](const std::vector<int64_t> & used) {
+        for (size_t id = 0; id < nd; id++) {
+            if (used[id] + margins_per_dev[id] > free_per_dev[id]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    auto describe = [&](const std::vector<int64_t> & used) {
+        std::string s;
+        for (size_t id = 0; id < nd; id++) {
+            const int64_t left = free_per_dev[id] - used[id] - margins_per_dev[id];
+            s += "dev" + std::to_string(id) + ": " + std::to_string(used[id]/MiB) + " MiB used, "
+               + std::to_string(left/MiB) + " MiB " + (left >= 0 ? "spare" : "SHORT") + "; ";
+        }
+        return s;
+    };
+    auto note = [&](uint32_t c, uint32_t u, const std::vector<int64_t> & used) {
+        plan.notes.push_back("n_ctx = " + std::to_string(c) + ", n_ubatch = " + std::to_string(u) + " -> " + describe(used));
+    };
+
+    std::vector<int64_t> used = used_per_dev(plan.n_ctx, plan.n_ubatch);
+    note(plan.n_ctx, plan.n_ubatch, used);
+    if (fits(used)) {
+        plan.fits = true;
+        return plan;
+    }
+
+    // leva 1: l'ubatch (i buffer di calcolo crescono con l'ubatch, il contesto e' cio' che l'utente vuole tenere)
+    while (plan.n_ubatch > n_ubatch_min) {
+        plan.n_ubatch = std::max(plan.n_ubatch/2, n_ubatch_min);
+        used = used_per_dev(plan.n_ctx, plan.n_ubatch);
+        note(plan.n_ctx, plan.n_ubatch, used);
+        if (fits(used)) {
+            plan.fits = true;
+            return plan;
+        }
+    }
+
+    // leva 2: il contesto
+    if (n_ctx_locked || plan.n_ctx <= n_ctx_min) {
+        plan.notes.push_back(n_ctx_locked ? "context size locked, not reducing it" : "context size already at the minimum");
+        return plan;
+    }
+    const std::vector<int64_t> used_max = used;
+    const std::vector<int64_t> used_min = used_per_dev(n_ctx_min, plan.n_ubatch);
+    note(n_ctx_min, plan.n_ubatch, used_min);
+    if (!fits(used_min)) {
+        plan.n_ctx = n_ctx_min;
+        plan.notes.push_back("does not fit even at the minimum context size");
+        return plan;
+    }
+    // interpolazione lineare per scheda: il contesto che entra e' il minimo fra le schede
+    uint32_t cand = n_ctx;
+    for (size_t id = 0; id < nd; id++) {
+        const int64_t slope_num = used_max[id] - used_min[id];
+        if (slope_num <= 0) {
+            continue;
+        }
+        const int64_t budget = free_per_dev[id] - margins_per_dev[id] - used_min[id]; // >= 0, visto che used_min entra
+        const uint64_t cand_id = n_ctx_min + (uint64_t) budget * (n_ctx - n_ctx_min) / slope_num;
+        cand = (uint32_t) std::min<uint64_t>(cand, cand_id);
+    }
+    auto align_down = [&](uint32_t c) { return std::max(c - c % n_ctx_align, n_ctx_min); };
+    cand = align_down(std::min(cand, n_ctx - 1));
+    while (true) {
+        used = used_per_dev(cand, plan.n_ubatch);
+        note(cand, plan.n_ubatch, used);
+        if (fits(used)) {
+            plan.n_ctx = cand;
+            plan.fits  = true;
+            return plan;
+        }
+        if (cand <= n_ctx_min) {
+            plan.n_ctx = n_ctx_min;
+            plan.notes.push_back("could not fit by reducing context (non-linear memory growth)");
+            return plan;
+        }
+        // passo del 5% (almeno un allineamento) verso il basso: la memoria non e' perfettamente lineare
+        cand = align_down(cand - std::max(n_ctx_align, cand/20));
+    }
 }
 
 enum common_params_fit_status common_fit_params(

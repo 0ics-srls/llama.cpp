@@ -1,6 +1,9 @@
 #pragma once
 
 #include "ggml.h" // for ggml_log_level
+#include "ggml-backend.h"
+
+#include <map>
 
 #include <string>
 #include <type_traits>
@@ -101,5 +104,10 @@ std::string format(const char * fmt, ...);
 
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
+
+// memory breakdown: un buffer meta (tensor split) viene attribuito alle schede semplici che lo compongono
+void llama_memory_breakdown_add(std::map<ggml_backend_buffer_type_t, size_t> & ret, ggml_backend_buffer_t buf);
+// idem senza allocazione (hparams.no_alloc): dimensione dei tensori di ctx per scheda
+void llama_memory_breakdown_add(std::map<ggml_backend_buffer_type_t, size_t> & ret, struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
 
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);

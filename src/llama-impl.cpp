@@ -107,6 +107,34 @@ std::string llama_format_tensor_shape(const std::vector<int64_t> & ne) {
     return buf;
 }
 
+void llama_memory_breakdown_add(std::map<ggml_backend_buffer_type_t, size_t> & ret, ggml_backend_buffer_t buf) {
+    if (ggml_backend_buffer_is_meta(buf)) {
+        const size_t n = ggml_backend_meta_buffer_n_bufs(buf);
+        for (size_t i = 0; i < n; i++) {
+            ggml_backend_buffer_t simple = ggml_backend_meta_buffer_simple_buffer(buf, i);
+            if (simple == nullptr) {
+                continue;
+            }
+            ret[ggml_backend_buffer_get_type(simple)] += ggml_backend_buffer_get_size(simple);
+        }
+        return;
+    }
+    ret[ggml_backend_buffer_get_type(buf)] += ggml_backend_buffer_get_size(buf);
+}
+
+void llama_memory_breakdown_add(std::map<ggml_backend_buffer_type_t, size_t> & ret, struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
+    if (ggml_backend_buft_is_meta(buft)) {
+        const size_t n = ggml_backend_meta_buft_n_bufts(buft);
+        std::vector<size_t> sizes(n, 0);
+        ggml_backend_meta_alloc_ctx_tensors_from_buft_size_per_dev(ctx, buft, sizes.data());
+        for (size_t i = 0; i < n; i++) {
+            ret[ggml_backend_meta_buft_simple_buft(buft, i)] += sizes[i];
+        }
+        return;
+    }
+    ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
+}
+
 std::string llama_format_tensor_shape(const struct ggml_tensor * t) {
     char buf[256];
     snprintf(buf, sizeof(buf), "%6" PRId64, t->ne[0]);
