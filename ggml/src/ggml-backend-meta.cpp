@@ -313,11 +313,37 @@ static size_t ggml_backend_meta_buffer_type_get_max_size(ggml_backend_buffer_typ
     return max_size;
 }
 
+static const std::vector<ggml_type> & ggml_backend_meta_kv_types();
+static bool ggml_backend_meta_is_kv_cache_tensor(const ggml_tensor * tensor);
+
 static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+    const auto & kv_types = ggml_backend_meta_kv_types();
     size_t max_alloc_size = 0;
     for (size_t i = 0; i < n_simple_bufts; i++) {
-        const size_t alloc_size = ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, i), tensor);
+        ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, i);
+        size_t alloc_size;
+        if (kv_types.empty() || i >= kv_types.size()) {
+            alloc_size = ggml_backend_buft_get_alloc_size(simple_buft, tensor);
+        } else {
+            // volta-ada: cache mista. Lo spazio extra che un op chiede (es. la flash attention CUDA per dequantizzare
+            // K/V in f16) dipende dal TIPO DELLE SORGENTI: va valutato con il tipo della fetta di questa scheda.
+            ggml_tensor t = *tensor;
+            ggml_tensor srcs[GGML_MAX_SRC];
+            for (int k = 0; k < GGML_MAX_SRC; k++) {
+                const ggml_tensor * src = tensor->src[k];
+                if (src == nullptr) {
+                    continue;
+                }
+                const ggml_tensor * root = src->view_src != nullptr ? src->view_src : src;
+                if (ggml_backend_meta_is_kv_cache_tensor(root) && src->type == root->type && kv_types[i] != src->type) {
+                    srcs[k] = *src;
+                    srcs[k].type = kv_types[i];
+                    t.src[k] = &srcs[k];
+                }
+            }
+            alloc_size = ggml_backend_buft_get_alloc_size(simple_buft, &t);
+        }
         max_alloc_size = std::max(max_alloc_size, alloc_size);
     }
     return max_alloc_size;
@@ -1247,6 +1273,10 @@ static ggml_type ggml_backend_meta_slice_type(const ggml_tensor * tensor, size_t
         if (src_j != nullptr && src_j->type != tensor->view_src->type && tensor->type == tensor->view_src->type) {
             return src_j->type;
         }
+        if (getenv("GGML_META_KV_DEBUG") != nullptr && ggml_backend_meta_is_kv_cache_tensor(tensor->view_src)) {
+            GGML_LOG_INFO("KVDBG NOCONV %s op=%s type=%s view_src=%s src_j=%s\n", tensor->name, ggml_op_name(tensor->op),
+                ggml_type_name(tensor->type), ggml_type_name(tensor->view_src->type), src_j ? ggml_type_name(src_j->type) : "NULL");
+        }
     }
     return tensor->type;
 }
@@ -1366,6 +1396,19 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 t_ij->view_offs = ggml_backend_meta_conv_bytes(t_ij->view_offs, tensor->type, type_j);
             }
         }
+        // volta-ada: GGML_META_KV_DEBUG=1 stampa le fette (j=0) della cache KV e delle sue viste, per confrontare i layout
+        if (j == 0 && getenv("GGML_META_KV_DEBUG") != nullptr &&
+                (ggml_backend_meta_is_kv_cache_tensor(tensor) || (tensor->view_src != nullptr && ggml_backend_meta_is_kv_cache_tensor(tensor->view_src)))) {
+            static int n_printed = 0;
+            if (n_printed < 2000000) {
+                n_printed++;
+                GGML_LOG_INFO("KVDBG %s op=%s type=%s->%s ne=[%lld,%lld,%lld,%lld] nb_meta=[%zu,%zu,%zu,%zu] nb_j=[%zu,%zu,%zu,%zu] offs_meta=%zu offs_j=%zu\n",
+                    tensor->name, ggml_op_name(tensor->op), ggml_type_name(tensor->type), ggml_type_name(type_j),
+                    (long long) t_ij->ne[0], (long long) t_ij->ne[1], (long long) t_ij->ne[2], (long long) t_ij->ne[3],
+                    tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
+                    t_ij->nb[0], t_ij->nb[1], t_ij->nb[2], t_ij->nb[3], tensor->view_offs, t_ij->view_offs);
+            }
+        }
         // TODO: revisit once the graph allocator has been refactored, see https://github.com/ggml-org/llama.cpp/pull/25051#issuecomment-4842873396
         ggml_backend_buffer_t init_buf = simple_buf;
         if (t_ij->view_src != nullptr) {
@@ -1438,6 +1481,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
 
 static void ggml_backend_meta_buffer_memset_tensor(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    if (getenv("GGML_META_KV_DEBUG") != nullptr && (ggml_backend_meta_is_kv_cache_tensor(tensor) || (tensor->view_src && ggml_backend_meta_is_kv_cache_tensor(tensor->view_src)))) { GGML_LOG_INFO("KVDBG IO %s %s offset=%zu size=%zu\n", "memset", tensor->name, offset, size); }
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state =
             ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
@@ -1542,6 +1586,7 @@ static void ggml_backend_meta_buffer_memset_tensor(
 }
 
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (getenv("GGML_META_KV_DEBUG") != nullptr && (ggml_backend_meta_is_kv_cache_tensor(tensor) || (tensor->view_src && ggml_backend_meta_is_kv_cache_tensor(tensor->view_src)))) { GGML_LOG_INFO("KVDBG IO %s %s offset=%zu size=%zu\n", "set", tensor->name, offset, size); }
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -1699,6 +1744,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 }
 
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (getenv("GGML_META_KV_DEBUG") != nullptr && (ggml_backend_meta_is_kv_cache_tensor(tensor) || (tensor->view_src && ggml_backend_meta_is_kv_cache_tensor(tensor->view_src)))) { GGML_LOG_INFO("KVDBG IO %s %s offset=%zu size=%zu\n", "get", tensor->name, offset, size); }
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
