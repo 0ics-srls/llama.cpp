@@ -289,8 +289,22 @@ static __global__ void ggml_cuda_ar_quant_q8_kernel(
 // Variante a BLOCCHI (GGML_CUDA_AR_WIRE=q8): scala per 32 valori, in half, layout
 //   [int8 q[ne0*nrows]] [pad a 16] [half scale[nrows*ne0/32]]
 // Un blocco di 256 thread per riga: ogni warp quantizza un blocco di 32 alla volta (un valore per lane).
+// Scala del blocco sul filo: half (q8h, la prima versione) o bf16 (q8). In half la scala sotto 6,1e-5 e'
+// subnormale (precisione che crolla fino a 0) e sopra 65504 diventa inf: i blocchi piccoli del flusso residuo
+// prendono una scala sbagliata. bf16 ha l'intervallo del f32 con 8 bit di mantissa: per una scala basta.
+template <typename S> static __device__ __forceinline__ S     ggml_cuda_ar_scale_from_f32(float f);
+template <typename S> static __device__ __forceinline__ float ggml_cuda_ar_scale_to_f32(S v);
+template <> __device__ __forceinline__ half         ggml_cuda_ar_scale_from_f32<half>(float f)         { return __float2half(f); }
+template <> __device__ __forceinline__ float        ggml_cuda_ar_scale_to_f32<half>(half v)            { return __half2float(v); }
+template <> __device__ __forceinline__ nv_bfloat16  ggml_cuda_ar_scale_from_f32<nv_bfloat16>(float f)  { return __float2bfloat16(f); }
+template <> __device__ __forceinline__ float        ggml_cuda_ar_scale_to_f32<nv_bfloat16>(nv_bfloat16 v) { return __bfloat162float(v); }
+
+// Contatori diagnostici (GGML_CUDA_AR_CHECK=N): [0] blocchi, [1] scala < 6,1e-5 (subnormale in half),
+// [2] scala == 0 dopo la conversione in half, [3] scala > 65504 (inf in half), [4] amax > 1e4 (attivazione massiva)
+template <typename S>
 static __global__ void ggml_cuda_ar_quant_q8b_kernel(
-        const float * __restrict__ x, int8_t * __restrict__ q, half * __restrict__ scale, const int ne0) {
+        const float * __restrict__ x, int8_t * __restrict__ q, S * __restrict__ scale, const int ne0,
+        unsigned long long * __restrict__ cnt) {
     const int row  = blockIdx.x;
     const int nblk = ne0 / 32;
     const int lane = threadIdx.x & 31;
@@ -308,22 +322,31 @@ static __global__ void ggml_cuda_ar_quant_q8b_kernel(
         const float isc = sc > 0.0f ? 1.0f / sc : 0.0f;
         qr[blk * 32 + lane] = (int8_t) __float2int_rn(v * isc);
         if (lane == 0) {
-            scale[(size_t) row * nblk + blk] = __float2half(sc);
+            scale[(size_t) row * nblk + blk] = ggml_cuda_ar_scale_from_f32<S>(sc);
+            if (cnt != nullptr) {
+                atomicAdd(&cnt[0], 1ull);
+                if (sc > 0.0f && sc < 6.1e-5f) { atomicAdd(&cnt[1], 1ull); }
+                if (sc > 0.0f && __half2float(__float2half(sc)) == 0.0f) { atomicAdd(&cnt[2], 1ull); }
+                if (sc > 65504.0f) { atomicAdd(&cnt[3], 1ull); }
+                if (amax > 1.0e4f) { atomicAdd(&cnt[4], 1ull); }
+            }
         }
     }
 }
 
+template <typename S>
 static __global__ void ggml_cuda_ar_add_q8b_kernel(
         float * __restrict__ dst, const int8_t * __restrict__ q_mine, const int8_t * __restrict__ q_peer,
         const int ne0, const size_t scale_off) {
     const int row  = blockIdx.x;
     const int nblk = ne0 / 32;
-    const half * s_mine = reinterpret_cast<const half *>(reinterpret_cast<const char *>(q_mine) + scale_off) + (size_t) row * nblk;
-    const half * s_peer = reinterpret_cast<const half *>(reinterpret_cast<const char *>(q_peer) + scale_off) + (size_t) row * nblk;
+    const S * s_mine = reinterpret_cast<const S *>(reinterpret_cast<const char *>(q_mine) + scale_off) + (size_t) row * nblk;
+    const S * s_peer = reinterpret_cast<const S *>(reinterpret_cast<const char *>(q_peer) + scale_off) + (size_t) row * nblk;
     const size_t base = (size_t) row * ne0;
     for (int i = threadIdx.x; i < ne0; i += blockDim.x) {
         const int blk = i >> 5;
-        dst[base + i] = (float) q_mine[base + i] * __half2float(s_mine[blk]) + (float) q_peer[base + i] * __half2float(s_peer[blk]);
+        dst[base + i] = (float) q_mine[base + i] * ggml_cuda_ar_scale_to_f32<S>(s_mine[blk])
+                      + (float) q_peer[base + i] * ggml_cuda_ar_scale_to_f32<S>(s_peer[blk]);
     }
 }
 
@@ -438,7 +461,13 @@ struct ggml_cuda_ar_pipeline {
     int                      pre_slot;
     // filo a 8 bit (GGML_CUDA_AR_WIRE=q8): geometria della chiamata in corso
     bool                     wire_q8;
-    bool                     wire_q8_block;   // scala per blocco di 32 (q8) invece che per riga (q8row)
+    bool                     wire_q8_block;   // scala per blocco di 32 (q8, q8h) invece che per riga (q8row)
+    bool                     wire_q8_half;    // q8h: scala del blocco in half (prima versione); q8: bf16
+    int64_t                  wire_min_rows;   // GGML_CUDA_AR_WIRE_MIN_ROWS=N: filo int8 solo con almeno N righe (token)
+                                              // nel tensore, cioe' nel prefill; sotto (decodifica, draft MTP) resta bf16
+    uint64_t                 check_every;     // GGML_CUDA_AR_CHECK=N: stampa i contatori dei blocchi ogni N chiamate q8
+    uint64_t                 check_n;
+    unsigned long long *     check_cnt[GGML_CUDA_MAX_DEVICES];
     int                      wire_ne0;
     size_t                   wire_scale_off;
     char *                   bf16_wire[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE];
@@ -563,11 +592,29 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     p->async_add        = ggml_cuda_ar_env_u64("GGML_CUDA_AR_ASYNC_ADD", 0) != 0;
     {
         const char * wire = getenv("GGML_CUDA_AR_WIRE");
-        p->wire_q8_block = wire != nullptr && strcmp(wire, "q8") == 0;
+        p->wire_q8_half  = wire != nullptr && strcmp(wire, "q8h") == 0;
+        p->wire_q8_block = p->wire_q8_half || (wire != nullptr && strcmp(wire, "q8") == 0);
         p->wire_q8 = p->wire_q8_block || (wire != nullptr && strcmp(wire, "q8row") == 0);
         if (p->wire_q8) {
-            GGML_LOG_INFO("%s: filo a 8 bit (int8 + scala per %s) per il percorso copy-engine\n", __func__,
-                p->wire_q8_block ? "blocco di 32, half" : "riga");
+            GGML_LOG_WARN("%s: filo a 8 bit (int8 + scala per %s) per il percorso copy-engine\n", __func__,
+                p->wire_q8_block ? (p->wire_q8_half ? "blocco di 32, half" : "blocco di 32, bf16") : "riga");
+        }
+        p->wire_min_rows = (int64_t) ggml_cuda_ar_env_u64("GGML_CUDA_AR_WIRE_MIN_ROWS", 1);
+        if (p->wire_q8 && p->wire_min_rows > 1) {
+            GGML_LOG_WARN("%s: filo a 8 bit solo con almeno %lld righe (prefill); decodifica in bf16\n", __func__, (long long) p->wire_min_rows);
+        }
+        p->check_every = ggml_cuda_ar_env_u64("GGML_CUDA_AR_CHECK", 0);
+        p->check_n = 0;
+        for (size_t i = 0; i < n_devices; ++i) {
+            p->check_cnt[i] = nullptr;
+            if (p->check_every > 0 && p->wire_q8_block) {
+                ggml_cuda_set_device(devices[i]);
+                CUDA_CHECK(cudaMalloc(&p->check_cnt[i], 8 * sizeof(unsigned long long)));
+                CUDA_CHECK(cudaMemset(p->check_cnt[i], 0, 8 * sizeof(unsigned long long)));
+            }
+        }
+        if (p->check_every > 0) {
+            GGML_LOG_WARN("%s: AR check: contatori dei blocchi ogni %llu chiamate\n", __func__, (unsigned long long) p->check_every);
         }
     }
     p->pre_slot         = -1;
@@ -877,8 +924,14 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         if constexpr (std::is_same<T_src, int8_t>::value) {
             // filo a 8 bit: ne qui sono i BYTE del buffer sul filo; la geometria sta in p->wire_*
             const int nrows = (int) ((p->wire_scale_off) / (size_t) p->wire_ne0);
-            if (p->wire_q8_block) {
-                ggml_cuda_ar_add_q8b_kernel<<<nrows, block_size, 0, add_stream>>>(
+            if (p->wire_q8_block && p->wire_q8_half) {
+                ggml_cuda_ar_add_q8b_kernel<half><<<nrows, block_size, 0, add_stream>>>(
+                    reinterpret_cast<float *>(dst_buf[i]),
+                    reinterpret_cast<const int8_t *>(src_buf[i]),
+                    reinterpret_cast<const int8_t *>(p->dev_tmp[i]),
+                    p->wire_ne0, p->wire_scale_off);
+            } else if (p->wire_q8_block) {
+                ggml_cuda_ar_add_q8b_kernel<nv_bfloat16><<<nrows, block_size, 0, add_stream>>>(
                     reinterpret_cast<float *>(dst_buf[i]),
                     reinterpret_cast<const int8_t *>(src_buf[i]),
                     reinterpret_cast<const int8_t *>(p->dev_tmp[i]),
@@ -1014,11 +1067,12 @@ static bool ggml_cuda_ar_allreduce_impl(
         const int64_t ne0   = tensors[0]->ne[0];
         const int64_t nrows = ne0 > 0 ? ne / ne0 : 0;
         const size_t  q_off = ((size_t) ne + 15) / 16 * 16;
-        const size_t  scale_bytes = p->wire_q8_block ? (size_t) nrows * (size_t) (ne0 / 32) * sizeof(half)
+        const size_t  scale_bytes = p->wire_q8_block ? (size_t) nrows * (size_t) (ne0 / 32) * 2   // half o bf16
                                                      : (size_t) nrows * sizeof(float);
         const size_t  wire_nbytes = (q_off + scale_bytes + 15) / 16 * 16;
         const bool use_q8 = p->wire_q8 && use_copy_engine && input_type == GGML_TYPE_F32 &&
-            ne0 > 0 && ne % ne0 == 0 && ne0 % (p->wire_q8_block ? 32 : 4) == 0 && wire_nbytes <= p->copy_bytes;
+            ne0 > 0 && ne % ne0 == 0 && ne0 % (p->wire_q8_block ? 32 : 4) == 0 && wire_nbytes <= p->copy_bytes &&
+            nrows >= p->wire_min_rows;
         if (use_q8) {
             p->wire_ne0       = (int) ne0;
             p->wire_scale_off = q_off;
@@ -1042,10 +1096,14 @@ static bool ggml_cuda_ar_allreduce_impl(
                 }
                 ggml_cuda_set_device(p->devices[i]);
                 if (compute_flag[i]) {
-                    if (p->wire_q8_block) {
-                        ggml_cuda_ar_quant_q8b_kernel<<<(int) nrows, 256, 0, cuda_ctx->stream()>>>(
+                    if (p->wire_q8_block && p->wire_q8_half) {
+                        ggml_cuda_ar_quant_q8b_kernel<half><<<(int) nrows, 256, 0, cuda_ctx->stream()>>>(
                             static_cast<const float *>(tensors[i]->data), reinterpret_cast<int8_t *>(wire),
-                            reinterpret_cast<half *>(wire + q_off), (int) ne0);
+                            reinterpret_cast<half *>(wire + q_off), (int) ne0, p->check_cnt[i]);
+                    } else if (p->wire_q8_block) {
+                        ggml_cuda_ar_quant_q8b_kernel<nv_bfloat16><<<(int) nrows, 256, 0, cuda_ctx->stream()>>>(
+                            static_cast<const float *>(tensors[i]->data), reinterpret_cast<int8_t *>(wire),
+                            reinterpret_cast<nv_bfloat16 *>(wire + q_off), (int) ne0, p->check_cnt[i]);
                     } else {
                         ggml_cuda_ar_quant_q8_kernel<<<(int) nrows, 256, 0, cuda_ctx->stream()>>>(
                             static_cast<const float *>(tensors[i]->data), reinterpret_cast<int8_t *>(wire),
@@ -1058,6 +1116,16 @@ static bool ggml_cuda_ar_allreduce_impl(
                 src[i] = reinterpret_cast<int8_t *>(wire);
                 dst[i] = static_cast<float *>(tensors[i]->data);
                 inner_compute[i] = true;
+            }
+            if (p->check_every > 0 && p->check_cnt[0] != nullptr && ++p->check_n % p->check_every == 0) {
+                unsigned long long c[8] = {0};
+                auto * ctx0 = static_cast<ggml_backend_cuda_context *>(backends[0]->context);
+                ggml_cuda_set_device(p->devices[0]);
+                CUDA_CHECK(cudaMemcpyAsync(c, p->check_cnt[0], sizeof(c), cudaMemcpyDeviceToHost, ctx0->stream()));
+                CUDA_CHECK(cudaStreamSynchronize(ctx0->stream()));
+                const double b = c[0] > 0 ? (double) c[0] : 1.0;
+                GGML_LOG_WARN("AR check: chiamate %llu, ultima [%d x %lld]: blocchi %llu, scala subnormale-half %.3f%%, zero-half %.3f%%, inf-half %llu, amax>1e4 %llu\n",
+                    (unsigned long long) p->check_n, (int) ne0, (long long) nrows, c[0], 100.0 * c[1] / b, 100.0 * c[2] / b, c[3], c[4]);
             }
             return ggml_cuda_ar_allreduce_copy_outer<int8_t, float>(p, backends, src, dst, inner_compute, (int64_t) wire_nbytes);
         }
