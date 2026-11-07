@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include "bridge.h"
 #include "llama.h"
 
 #include <string>
@@ -13,6 +14,7 @@
 
 
 enum server_task_type {
+    SERVER_TASK_TYPE_WINNOW,
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
@@ -75,6 +77,8 @@ struct task_params {
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
 
+    std::vector<llama_token> logprob_token_ids; // exact log-probabilities of these tokens at each generated position
+
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
 
@@ -134,6 +138,7 @@ struct task_result_state {
 };
 
 struct server_task {
+    std::shared_ptr<winnow::Request> winnow_request;
     int id = -1; // to be filled by server_queue
 
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
@@ -306,6 +311,7 @@ struct completion_token_output {
         float prob;
     };
     std::vector<prob_info> probs;
+    std::vector<float> id_logprobs; // one per task_params::logprob_token_ids, in request order
 
     json to_json(bool post_sampling_probs) const;
 

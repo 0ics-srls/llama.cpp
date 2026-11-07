@@ -880,6 +880,8 @@ private:
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
+    std::unique_ptr<winnow::Service> winnow_service;
+    bool winnow_resident_spec = false;
 
     llama_context * ctx_tgt = nullptr;
 
@@ -936,6 +938,7 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        winnow_service.reset();
         spec.reset();
         spec_init.reset();
 
@@ -1021,6 +1024,27 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+        const char * resident_mtp = std::getenv("WINNOW_RESIDENT_MTP");
+        if (resident_mtp && std::string(resident_mtp) != "0" && std::string(resident_mtp) != "1")
+            throw std::invalid_argument("WINNOW_RESIDENT_MTP must be 0 or 1");
+        winnow_resident_spec = resident_mtp && std::string(resident_mtp) == "1";
+        const char * vision_mtp = std::getenv("WINNOW_RESIDENT_VISION_MTP");
+        if (vision_mtp && std::string(vision_mtp) != "0" && std::string(vision_mtp) != "1")
+            throw std::invalid_argument("WINNOW_RESIDENT_VISION_MTP must be 0 or 1");
+        const bool resident_vision = vision_mtp && std::string(vision_mtp) == "1";
+        if (resident_vision && (!winnow_resident_spec || !has_mmproj))
+            throw std::invalid_argument("Vision MTP opt-in requires resident MTP and a projector");
+        if (winnow_resident_spec) {
+            const char * memory = std::getenv("WINNOW_MEMORY");
+            if (std::count(params_base.speculative.types.begin(), params_base.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != 1 ||
+                    !std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](common_speculative_type t) {
+                        return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+                    }) || !spec_mtp || !has_draft ||
+                    params_base.n_parallel != 1 || (has_mmproj && !resident_vision) || !params_base.lora_adapters.empty() ||
+                    !memory || std::string(memory) != "auto")
+                throw std::invalid_argument("Resident MTP requires one draft-mtp type, external draft, single chat slot, explicit vision opt-in for projector, no LoRA and WINNOW_MEMORY=auto");
+        }
+
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1386,6 +1410,25 @@ private:
         // propagate new defaults back to caller
         params = params_base;
 
+        if (winnow_resident_spec && (!spec || !ctx_dft || !model_dft ||
+                (llama_model_n_embd(model_tgt) != 3840 && llama_model_n_embd(model_tgt) != 2560 && llama_model_n_embd(model_tgt) != 1536) ||
+                llama_model_n_embd_out(model_dft) != llama_model_n_embd(model_tgt) ||
+                llama_vocab_n_tokens(llama_model_get_vocab(model_tgt)) != 262144))
+            throw std::invalid_argument("Resident MTP target/assistant context unavailable or unsupported target shape");
+        if (params_base.lora_adapters.empty() && (!spec || winnow_resident_spec)) {
+            winnow::Hooks hooks;
+            hooks.require_resident_chat = winnow_resident_spec;
+            hooks.chat_active = [this]{ return winnow_chat_active(); };
+            hooks.suspend_chat = [this]{ winnow_suspend_chat(); };
+            hooks.cooperate = [this]{
+                if (queue_tasks.winnow_poll()) throw std::runtime_error("Server shutting down");
+                if (ctx_tgt && !winnow_resident_spec) update_slots();
+            };
+            winnow_service = std::make_unique<winnow::Service>(model_tgt, mctx, n_ctx,
+                params_base.n_batch, params_base.n_ubatch, params_base.cpuparams.n_threads,
+                model_name, std::move(hooks));
+        }
+
         if (!is_resume) {
             return init();
         }
@@ -1409,13 +1452,22 @@ private:
             return process_single_task(std::move(task), is_yielding);
         });
         queue_tasks.on_update_slots([this]() {
-            update_slots();
+            if (winnow_service && winnow_service->pending()) {
+                winnow_service->tick();
+                queue_tasks.pop_deferred_task(-1);
+                if (winnow_service->pending()) {
+                    server_task wake(SERVER_TASK_TYPE_NEXT_RESPONSE);
+                    wake.id = queue_tasks.get_new_id(); queue_tasks.post(std::move(wake));
+                }
+            }
+            if (ctx_tgt) update_slots();
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
 
         metrics.init();
+
 
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
@@ -2015,6 +2067,35 @@ private:
                     cur[i].p
                 });
             }
+
+            // exact log-probabilities of the requested tokens over the full vocabulary (logprob_token_ids)
+            const auto & want = slot.task->params.logprob_token_ids;
+            if (!want.empty()) {
+                const float       * logits      = llama_get_logits_ith(ctx_tgt, idx);
+                const llama_token * sampled_ids = llama_get_sampled_candidates_ith(ctx_tgt, idx);
+                const int           n_logits    = llama_get_sampled_logits_count_ith(ctx_tgt, idx);
+                float max_logit = -INFINITY;
+                for (int i = 0; i < n_logits; i++) {
+                    max_logit = std::max(max_logit, logits[i]);
+                }
+                double sum = 0.0;
+                for (int i = 0; i < n_logits; i++) {
+                    sum += std::exp((double) logits[i] - max_logit);
+                }
+                const double lse = max_logit + std::log(sum);
+                result.id_logprobs.reserve(want.size());
+                for (const llama_token tok : want) {
+                    int pos = -1;
+                    if (sampled_ids) {
+                        for (int i = 0; i < n_logits; i++) {
+                            if (sampled_ids[i] == tok) { pos = i; break; }
+                        }
+                    } else if (tok < n_logits) {
+                        pos = tok;
+                    }
+                    result.id_logprobs.push_back(pos < 0 ? -1e30f : (float) ((double) logits[pos] - lse));
+                }
+            }
         }
     }
 
@@ -2371,6 +2452,31 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
+    bool winnow_chat_active() const {
+        for (const auto & slot : slots) if (slot.is_processing()) return true;
+        return false;
+    }
+    void winnow_suspend_chat() {
+        if (!ctx_tgt) return;
+        if (winnow_chat_active() || spec) throw std::runtime_error("Chat context is busy or speculative");
+        metrics_flush_idle();
+        for (auto & slot : slots) {
+            slot.reset(); slot.prompt.clear(); slot.task_prev.reset();
+            slot.ctx_tgt = nullptr;
+        }
+        llama_init->winnow_release_context();
+        ctx_tgt = nullptr;
+        SRV_INF("%s", "Winnow released idle chat context; model weights retained\n");
+    }
+    void winnow_restore_chat() {
+        if (ctx_tgt) return;
+        if (winnow_service) winnow_service->release_idle();
+        if (!llama_init->winnow_restore_context(params_base)) throw std::runtime_error("Could not restore chat context");
+        ctx_tgt = llama_init->context();
+        for (auto & slot : slots) { slot.ctx_tgt = ctx_tgt; slot.mem.init(ctx_tgt, ctx_dft); }
+        SRV_INF("%s", "Winnow restored chat context; model weights reused\n");
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -2379,7 +2485,27 @@ private:
             return false;
         }
 
+        // Native engine and speculative target/draft contexts share model weights.
+        // Keep both context sets resident and serialize their inference work.
+        if (winnow_resident_spec && winnow_service && winnow_service->busy() &&
+                (task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL ||
+                 task.type == SERVER_TASK_TYPE_EMBEDDING || task.type == SERVER_TASK_TYPE_RERANK)) {
+            queue_tasks.defer(std::move(task));
+            return true;
+        }
+
+        if (!ctx_tgt && task.type != SERVER_TASK_TYPE_WINNOW && task.type != SERVER_TASK_TYPE_NEXT_RESPONSE &&
+                task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET &&
+                task.type != SERVER_TASK_TYPE_CANCEL) {
+            if (winnow_service && winnow_service->busy()) { queue_tasks.defer(std::move(task)); return true; }
+            try { winnow_restore_chat(); }
+            catch (const std::exception & e) { send_error(task, e.what(), ERROR_TYPE_SERVER); return true; }
+        }
         switch (task.type) {
+            case SERVER_TASK_TYPE_WINNOW:
+                if (winnow_service) winnow_service->enqueue(std::move(task.winnow_request));
+                else { task.winnow_request->status = 503; task.winnow_request->done.set_value("{\"error\":{\"message\":\"Decision runtime unavailable\"}}"); }
+                break;
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
@@ -4648,6 +4774,25 @@ json server_routes::get_model_info() const {
 }
 
 void server_routes::init_routes() {
+    this->post_systemone = [this](const server_http_req & req) -> server_http_res_ptr {
+        auto res = create_response();
+        if (req.body.size() > 32 * 1024 * 1024) {
+            res->status = 413; res->data = "{\"error\":{\"message\":\"Request exceeds 32 MiB\"}}"; return res;
+        }
+        auto job = std::make_shared<winnow::Request>();
+        job->body = req.body;
+        job->inspect = req.path.find("inspect") != std::string::npos;
+        auto result = job->done.get_future();
+        server_task task(SERVER_TASK_TYPE_WINNOW);
+        task.id = queue_tasks.get_new_id(); task.winnow_request = job;
+        queue_tasks.post(std::move(task));
+        while (result.wait_for(std::chrono::milliseconds(25)) != std::future_status::ready) {
+            if (req.should_stop()) { job->cancelled = true; res->status = 499; res->data = "{}"; return res; }
+        }
+        res->data = result.get(); res->status = job->status;
+        return res;
+    };
+
     // IMPORTANT: all lambda functions must start with create_response()
     // this is to ensure that the server_res_generator can handle sleeping case correctly
 

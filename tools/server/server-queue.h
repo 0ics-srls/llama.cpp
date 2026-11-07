@@ -93,6 +93,7 @@ public:
      * - Exit sleeping state
      */
     void start_loop(int64_t idle_sleep_ms = -1);
+    bool winnow_poll() { return process_new_tasks(false); }
 
     // while waiting for work() to finish, run process_new_tasks on the worker thread
     // returns once work() is done (may throw exceptions)

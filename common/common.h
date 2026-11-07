@@ -932,6 +932,8 @@ struct common_init_result {
 
     llama_model * model();
     llama_context * context();
+    void winnow_release_context();
+    bool winnow_restore_context(const common_params & params);
 
     common_sampler * sampler(llama_seq_id seq_id);
     void reset_samplers();
@@ -973,6 +975,7 @@ struct common_threadpools {
     common_threadpools & operator=(const common_threadpools &) = delete;
 
     void init(llama_context * ctx, const common_params & params);
+    void attach(llama_context * ctx);
 
 private:
     ggml_threadpool * threadpool       = nullptr;

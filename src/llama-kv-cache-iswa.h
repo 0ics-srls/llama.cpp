@@ -92,6 +92,9 @@ public:
 
 private:
     const bool unified;
+    const bool swa_full;
+    const uint32_t n_swa;
+    const llama_swa_type swa_type;
 
     std::unique_ptr<llama_kv_cache> kv_base;
     std::unique_ptr<llama_kv_cache> kv_swa;

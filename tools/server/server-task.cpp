@@ -284,7 +284,7 @@ json completion_token_output::probs_vector_to_json(const std::vector<completion_
     for (const auto & p : probs) {
         std::string txt(p.text_to_send);
         txt.resize(validate_utf8(txt));
-        out.push_back(json {
+        json entry {
             {"id",           p.tok},
             {"token",        txt},
             {"bytes",        str_to_bytes(p.text_to_send)},
@@ -296,7 +296,11 @@ json completion_token_output::probs_vector_to_json(const std::vector<completion_
                 post_sampling_probs ? "top_probs" : "top_logprobs",
                 p.to_json(post_sampling_probs)
             },
-        });
+        };
+        if (!p.id_logprobs.empty()) {
+            entry["id_logprobs"] = p.id_logprobs;
+        }
+        out.push_back(std::move(entry));
     }
     return out;
 }

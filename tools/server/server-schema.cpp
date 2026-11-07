@@ -472,6 +472,28 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             }
         }));
 
+    add((new field_json("logprob_token_ids"))
+        ->set_desc("Return the exact full-vocabulary log-probabilities of these token ids at each generated position (as vLLM's logprob_token_ids; needs n_probs > 0 and post_sampling_probs false)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_ASSERT(ctx.vocab != nullptr);
+            ctx.params.logprob_token_ids.clear();
+            const auto & ids = data.at("logprob_token_ids");
+            if (!ids.is_array()) {
+                throw std::invalid_argument("logprob_token_ids must be an array of token ids");
+            }
+            const int n_vocab = llama_vocab_n_tokens(ctx.vocab);
+            for (const auto & el : ids) {
+                if (!el.is_number_integer()) {
+                    throw std::invalid_argument("logprob_token_ids must be an array of token ids");
+                }
+                const llama_token tok = el.get<llama_token>();
+                if (tok < 0 || tok >= n_vocab) {
+                    throw std::invalid_argument("logprob_token_ids: token id out of range");
+                }
+                ctx.params.logprob_token_ids.push_back(tok);
+            }
+        }));
+
     add((new field_bool("ignore_eos", params.sampling.ignore_eos))
         ->set_desc("Ignore the end-of-sequence token and continue generating")
         ->set_handler([&](field_eval_context & ctx, const json & data) {

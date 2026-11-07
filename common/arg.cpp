@@ -766,7 +766,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     common_log_set_verbosity_thold(params.verbosity);
 
     // config file applies first, so env variables and CLI arguments override it
-    common_params_apply_system_config(params, ctx_arg.ex);
+    if (common_get_env("WINNOW_MANAGED_LAUNCH") != "1") {
+        common_params_apply_system_config(params, ctx_arg.ex);
+    }
 
     std::unordered_map<std::string, std::pair<common_arg *, bool>> arg_to_options;
     for (auto & opt : ctx_arg.options) {

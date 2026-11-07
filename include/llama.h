@@ -396,6 +396,7 @@ extern "C" {
         void *              abort_callback_data;
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
+        bool classifier_only; // Gemma: only requested final hidden states; no vocabulary logits/sampling
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
         bool no_perf;     // measure performance timings
@@ -1062,6 +1063,12 @@ extern "C" {
     // shape: [n_embd] (1-dimensional)
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
+
+    // Winnow extension: dequantize selected output rows once at startup.
+    // Returns embedding width, or zero for unsupported/scaled output tensors.
+    // dst must hold count * llama_model_n_embd(model) floats. No model mutation.
+    LLAMA_API int32_t llama_model_classifier_rows(const struct llama_model * model,
+            const llama_token * ids, int32_t count, float * dst, size_t dst_count, float * softcap);
 
     // Get the embeddings for a sequence id
     // Returns NULL if pooling_type is LLAMA_POOLING_TYPE_NONE

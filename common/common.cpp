@@ -1416,6 +1416,23 @@ llama_context * common_init_result::context() {
     return pimpl->context.get();
 }
 
+void common_init_result::winnow_release_context() {
+    if (pimpl->context) llama_synchronize(pimpl->context.get());
+    pimpl->context.reset();
+}
+
+bool common_init_result::winnow_restore_context(const common_params & params) {
+    if (pimpl->context) return true;
+    auto cp = common_context_params_to_llama(params);
+    if (params.sampling.backend_sampling) {
+        cp.samplers = pimpl->samplers_seq_config.data();
+        cp.n_samplers = pimpl->samplers_seq_config.size();
+    }
+    pimpl->context.reset(llama_init_from_model(pimpl->model.get(), cp));
+    if (pimpl->context) pimpl->threadpools.attach(pimpl->context.get());
+    return bool(pimpl->context);
+}
+
 common_sampler * common_init_result::sampler(llama_seq_id seq_id) {
     if (seq_id < 0 || seq_id >= (int) pimpl->samplers.size()) {
         return nullptr;
@@ -1780,6 +1797,10 @@ common_threadpools::~common_threadpools() {
     }
     free_fn(threadpool);
     free_fn(threadpool_batch);
+}
+
+void common_threadpools::attach(llama_context * ctx) {
+    if (threadpool) llama_attach_threadpool(ctx, threadpool, threadpool_batch);
 }
 
 void common_threadpools::init(llama_context * ctx, const common_params & params) {
